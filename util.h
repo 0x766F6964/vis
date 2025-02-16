@@ -14,6 +14,7 @@
 /* is c the start of a utf8 sequence? */
 #define ISUTF8(c)   (((c)&0xC0)!=0x80)
 #define ISASCII(ch) ((unsigned char)ch < 0x80)
+#define ISALPHA(c)  (BETWEEN((c), 'a', 'z') || BETWEEN((c), 'A', 'Z'))
 #define ISDIGIT(c)  (BETWEEN((c), '0', '9'))
 #define ISHEX(c)    (ISDIGIT((c)) || BETWEEN((c), 'a', 'f') || BETWEEN((c), 'A', 'F'))
 #define ISSPACE(c)  ((c) == ' ' || (c) == '\t')
@@ -23,6 +24,7 @@ typedef int32_t   i32;
 typedef uint32_t  u32;
 typedef uint32_t  b32;
 typedef int64_t   i64;
+typedef uint64_t  u64;
 typedef ptrdiff_t ix;
 
 typedef struct { ix len; u8 *data; } s8;

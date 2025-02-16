@@ -16,14 +16,16 @@
  * REPRESENTATION OR WARRANTY OF ANY KIND CONCERNING THE MERCHANTABILITY
  * OF THIS SOFTWARE OR ITS FITNESS FOR ANY PARTICULAR PURPOSE.
  */
-#include <string.h>
-#include <strings.h>
-#include <stdio.h>
+#define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
-#include <unistd.h>
-#include <limits.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "util.h"
 #include "sam.h"
@@ -33,6 +35,114 @@
 #include "text-motions.h"
 #include "text-objects.h"
 #include "text-regex.h"
+
+#if 0
+/*
+NOTE(rnp): tokens
+
+commands: second DELIM is always optional if command is terminated
+
+a DELIM arg DELIM: append arg to end   of selection/address
+i DELIM arg DELIM: insert arg to start of selection/address
+
+c DELIM arg DELIM: change selection/address to arg
+
+x DELIM arg DELIM: create selections for every match of     arg in selection/address
+y DELIM arg DELIM: create selections for every match of not arg in selection/address
+v DELIM arg DELIM: filter, run if arg is not contained      in selection/address
+g DELIM arg DELIM: filter, run if arg is     contained      in selection/address
+
+s DELIM arg DELIM arg DELIM: not currently supported because it is the same as x/arg/c/arg/
+                             but I don't see a reason not to have it
+
+X DELIM arg DELIM: all open files with name     matching arg
+Y DELIM arg DELIM: all open files with name not matching arg
+
+file commands: file is optional and defaults to current file; '!' forces an action
+
+e file: switch to file
+  - warn if current file is modified
+r file: read file into current selection/address
+w file: write  to file
+  - can take a range to write; warn if not given a name but obey !
+  - warn if file was modified by another process
+q file: close file
+  - warn if current file is modified
+
+addresses:
+
+0: beginning of file
+$: end of file
+.: current selection
+
+A1 , A2: From A1 to start of A2
+A1 ; A2: From A1 to end   of A2
+
+for ',' and ';'
+if A1 is ommited '0' is assumed
+if A2 is ommited '$' is assumed
+
+A1 - A2: A2 evaluated backwards starting from A1
+A1 + A2: A2 evaluated forwards  starting from A1
+
+for '-' and '+'
+if A1 is ommited '.' is assumed
+if A2 is ommited '1' is assumed
+
+ARGV is not useful, commands never have more than one argument
+
+Address should just be evaluated to a selection which is passed on as to the first command
+
+Each command will loop over all selections given and mutate them to a smaller set while performing
+their action.
+*/
+#endif
+
+#define GB(n) (n << 30ULL)
+typedef struct {
+	u8 *start;
+	u8 *end;
+	u8 *base;
+	ix  capacity;
+} Arena;
+
+#define SAM_TOKEN_TYPES \
+	X(ST_ADDRESS_DELIMETER) \
+	X(ST_ADDRESS_TARGET)    \
+	X(ST_COMMAND)           \
+	X(ST_DELIMETER)         \
+	X(ST_GROUP_END)         \
+	X(ST_GROUP_START)       \
+	X(ST_STRING)
+
+#define X(name) name,
+enum sam_token { SAM_TOKEN_TYPES };
+#undef X
+
+/* TODO(rnp): replace with a bit-table (we only need 1 u64) */
+#define ISSAMCOMMAND(cp) \
+((cp) == 'a' || (cp) == 'i' || (cp) == 'c' || (cp) == 'x' || (cp) == 'y' || (cp) == 'v' || \
+ (cp) == 'g' || (cp) == 's' || (cp) == 'X' || (cp) == 'Y' || (cp) == 'e' || (cp) == 'r' || \
+ (cp) == 'w' || (cp) == 'q')
+
+/* TODO(rnp): there are probably more */
+#define ISSAMDELIMETER(cp) ((cp) == '/' || (cp) == ';' || (cp) == ':' || (cp) == '%')
+
+typedef struct {
+	u8  *start;
+	u32  length;
+	enum sam_token type;
+} SamToken;
+
+#define SAM_DEFAULT_LEFT_ADDRESS      (SamToken){.start = (u8 *)"0", .length = 1, .type = ST_ADDRESS_TARGET}
+#define SAM_DEFAULT_RIGHT_ADDRESS     (SamToken){.start = (u8 *)"$", .length = 1, .type = ST_ADDRESS_TARGET}
+#define SAM_DEFAULT_ADDRESS_DELIMETER (SamToken){.start = (u8 *)";", .length = 1, .type = ST_ADDRESS_DELIMETER}
+
+typedef struct {
+	SamToken *tokens;
+	Arena    *backing;
+	u64       count;
+} SamTokenStream;
 
 #define MAX_ARGV 8
 
@@ -414,6 +524,234 @@ static const OptionDef options[] = {
 		VIS_HELP("Wrap lines at minimum of window width and wrapcolumn")
 	},
 };
+
+#define ASSERT(a) if (!(a)) { __asm volatile ("brk 0xf000"); }
+
+static Arena
+arena_new(void)
+{
+	Arena result = {0};
+	/* TODO(rnp): may not be supported everywhere */
+	void *store = mmap(0, GB(1), PROT_NONE, MAP_ANON|MAP_PRIVATE, -1, 0);
+	if (store != MAP_FAILED) {
+		/* NOTE(rnp): start by committing a single page; expand as needed */
+		madvise((u8 *)store + 4096, GB(1) - 4096, MADV_DONTNEED);
+		mprotect(store, 4096, PROT_READ|PROT_WRITE);
+		result.start    = result.base = store;
+		result.end      = result.start + 4096;
+		result.capacity = GB(1);
+	}
+	return result;
+}
+
+static void
+arena_release(Arena a)
+{
+	/* TODO(rnp): in debug mode either poison with asan or mark as
+	 * PROT_NONE with MADV_DONTNEED */
+	munmap(a.base, a.capacity);
+}
+
+static void
+arena_expand(Arena *a, ix needed_size)
+{
+	ASSERT(needed_size < a->capacity - (a->end - a->start));
+	ix committed = a->end - a->base;
+	ix used      = a->start - a->base;
+	while (committed < a->capacity && (committed - used) < needed_size)
+		committed <<= 1;
+	ix to_commit = committed - (a->end - a->base);
+	madvise(a->end, to_commit, MADV_NORMAL);
+	a->end += to_commit;
+}
+
+#define push_struct(b, t) alloc(b, t, 1)
+#define alloc(b, t, n) (t *)alloc_(b, sizeof(t), _Alignof(t), n)
+static void *
+alloc_(Arena *a, ix len, ix align, ix count)
+{
+	ix padding   = -(uintptr_t)a->start & (align - 1);
+	ix remaining = a->end - a->start - padding;
+	if (remaining <= 0 || remaining / len < count) {
+		if ((a->capacity - remaining) / len < count) {
+			arena_expand(a, len * count + padding);
+		} else {
+			ASSERT(0);
+		}
+	}
+
+	void *result = a->start + padding;
+	a->start += padding + count * len;
+	return memset(result, 0, count * len);
+}
+
+static s8
+consume(s8 raw, u32 count)
+{
+	ASSERT(raw.len >= count);
+	raw.data += count;
+	raw.len  -= count;
+	return raw;
+}
+
+static u32
+peek(s8 raw)
+{
+	u32 result = (u32)-1;
+	if (raw.len > 0)
+		result = raw.data[0];
+	return result;
+}
+
+/* TODO(rnp): stream writer */
+static void
+sam_token_print(int fd, SamToken t)
+{
+	s8 type = s8("type: ");
+	s8 raw  = s8("\nraw: ");
+	s8 nl   = s8("\n");
+	#define X(name) case name: write(fd, #name, sizeof(#name) - 1); break;
+	switch (t.type) {
+	SAM_TOKEN_TYPES
+	}
+	#undef X
+	write(fd, raw.data, raw.len);
+	write(fd, t.start, t.length);
+	write(fd, nl.data, nl.len);
+}
+
+static SamToken *
+sam_token_at(SamTokenStream *s, u32 type, s8 raw)
+{
+	SamToken *result = 0;
+	if (raw.len) {
+		result         = push_struct(s->backing, SamToken);
+		result->start  = raw.data;
+		result->type   = type;
+		result->length = 1;
+		s->count++;
+	}
+	return result;
+}
+
+static void
+push_sam_token(SamTokenStream *s, SamToken t)
+{
+	SamToken *token = push_struct(s->backing, SamToken);
+	*token          = t;
+	s->count++;
+}
+
+static b32
+sam_address(SamTokenStream *s, s8 *raw)
+{
+	b32 result = 0;
+	*raw   = s8_trim_space(*raw);
+	u32 cp = peek(*raw);
+	if (cp == '#' || cp == '$' || cp == '.' || cp == '+' || cp == '-' || cp == '\'' || ISDIGIT(cp)) {
+		SamToken *token = sam_token_at(s, ST_ADDRESS_TARGET, *raw);
+		if (token) {
+			if (cp == '\'') {
+				*raw = consume(*raw, 2);
+				token->length = 2;
+			} else {
+				do {
+					*raw = consume(*raw, 1);
+					cp   = peek(*raw);
+				} while (ISDIGIT(cp));
+				token->length = raw->data - token->start;
+			}
+			result = 1;
+		}
+	}
+
+	return result;
+}
+
+static void
+sam_string_until(SamTokenStream *s, s8 *raw, u32 end)
+{
+	SamToken *token = sam_token_at(s, ST_STRING, *raw);
+	if (token) {
+		*raw = s8_trim_space(*raw);
+		for (u32 cp = peek(*raw); raw->len > 0 && cp != end; cp = peek(*raw))
+			*raw = consume(*raw, 1);
+		token->length = raw->data - token->start;
+	}
+}
+
+static u32
+valid_command_length(s8 s)
+{
+	u32 result = s.len > 0 && ISALPHA(s.data[0]);
+	if (!result && s.len > 0 && (s.data[0] == '-' || s.data[0] == '_')) {
+		result = valid_command_length(consume(s, 1));
+		if (result)
+			result += 1;
+	}
+	return result;
+}
+
+static b32
+sam_command_string(SamTokenStream *s, s8 *raw)
+{
+	SamToken *token = 0;
+	u32 valid = valid_command_length(*raw);
+	if (valid) {
+		token         = sam_token_at(s, ST_STRING, *raw);
+		token->length = valid;
+		*raw = consume(*raw, valid);
+		while ((valid = valid_command_length(*raw)))
+			*raw = consume(*raw, valid);
+		token->length = raw->data - token->start;
+		if (token->length == 1)
+			token->type = ST_COMMAND;
+	}
+	return token != 0;
+}
+
+static void
+sam_lex(SamTokenStream *s, s8 raw)
+{
+	if (!sam_address(s, &raw))
+		push_sam_token(s, SAM_DEFAULT_LEFT_ADDRESS);
+
+	u32 cp = peek(raw);
+	if (cp == ',' || cp == ';') {
+		SamToken *token = sam_token_at(s, ST_ADDRESS_DELIMETER, raw);
+		if (token) raw = consume(raw, 1);
+	} else {
+		push_sam_token(s, SAM_DEFAULT_ADDRESS_DELIMETER);
+	}
+
+	if (!sam_address(s, &raw))
+		push_sam_token(s, SAM_DEFAULT_RIGHT_ADDRESS);
+
+	while (raw.len > 0) {
+		u32 cp = peek(raw);
+		if (cp == '{') {
+			sam_token_at(s, ST_GROUP_START, raw);
+			raw = consume(raw, 1);
+			sam_string_until(s, &raw, '}');
+			if (sam_token_at(s, ST_GROUP_END, raw))
+				raw = consume(raw, 1);
+		} else if (ISSAMDELIMETER(cp)) {
+			sam_token_at(s, ST_DELIMETER, raw);
+			raw = consume(raw, 1);
+			sam_string_until(s, &raw, cp);
+			if (sam_token_at(s, ST_DELIMETER, raw))
+				raw = consume(raw, 1);
+		} else {
+			if (!sam_command_string(s, &raw)) {
+				ASSERT(0);
+				/* TODO(rnp): invalid character */
+				SamToken *token = sam_token_at(s, ST_STRING, raw);
+				token->length   = raw.len;
+				raw.len         = 0;
+			}
+		}
+	}
+}
 
 bool sam_init(Vis *vis) {
 	if (!(vis->cmds = map_new()))
@@ -1206,6 +1544,24 @@ static void count_init(Command *cmd, int max) {
 }
 
 enum SamError sam_cmd(Vis *vis, const char *s) {
+	/* TODO: remove this */
+	{
+		Arena token_store = arena_new();
+		SamTokenStream token_stream = {0};
+		token_stream.backing = &token_store;
+		token_stream.tokens  = (SamToken *)token_store.start;
+		s8 raw = {.len = strlen(s), .data = (u8 *)s};
+		sam_lex(&token_stream, raw);
+
+		int fd = open("lex_log.txt", O_WRONLY|O_CREAT|O_TRUNC, 0660);
+		if (fd >= 0) {
+			for (u32 i = 0; i < token_stream.count; i++)
+				sam_token_print(fd, token_stream.tokens[i]);
+			close(fd);
+		}
+		arena_release(token_store);
+	}
+
 	enum SamError err = SAM_ERR_OK;
 	if (!s)
 		return err;
